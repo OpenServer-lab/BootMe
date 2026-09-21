@@ -1,0 +1,189 @@
+$ BootMe engine e2e (headless, no GUI): drives the exact step-machine the
+$ GUI app runs (bootme/engine.fly's bm_* jobs) against ordinary FILES as
+$ "virtual devices", so this can never touch real disks. The image is a
+$ 160,000-byte file (160-byte chunks appended 1000x), so multi-chunk
+$ flashing across several bm_chunk() (65536-byte) reads, the partial final
+$ chunk, and the whole-file deep-compare all get exercised. CWD-independent:
+$ every file it touches is created by this program itself and removed at
+$ the end.
+$
+$ Covers: bm_file_size probing (empty file and 160000 bytes), an EMPTY image
+$ rejected up front, a full flash+verify to "done" (whole-file byte
+$ equality is asserted independently, not just via the engine's own verify),
+$ a verify MISMATCH detected after the target is corrupted, a mid-flash
+$ cancel aborting promptly, and bm_fmt_size at several magnitudes.
+
+bring engine
+
+$ ---- 16-byte base repeated 5x = a 160-byte chunk (160 * 1000 == 160000) --
+job chunk160() {
+    base = bytes_from_hex("00112233445566778899aabbccddeeff102132435465768798a9bacbdcedfe0f")
+    give base + base + base + base + base
+}
+
+filesystem.write_bytes("bm_image.bin", chunk160())
+k = 0
+while k < 999 {
+    filesystem.append_bytes("bm_image.bin", chunk160())
+    k = k + 1
+}
+
+$ ---- bm_file_size probing ----
+filesystem.write_bytes("bm_empty0.bin", bytes_from_hex(""))
+e0 = filesystem.open("bm_empty0.bin")
+show("size of empty: {bm_file_size(e0)}")
+filesystem.close(e0)
+
+fh = filesystem.open("bm_image.bin")
+show("size of image: {bm_file_size(fh)}")
+filesystem.close(fh)
+
+$ ---- empty image is rejected before any write ----
+st1 = {"phase": "idle"}
+bm_reset(st1, "bm_empty0.bin", "bm_none.bin")
+show("empty image begin: {bm_flash_begin(st1) == No}")
+m1 = st1["message"]
+show("empty image message: {m1}")
+
+$ ---- full flash + verify to done ----
+filesystem.write_bytes("bm_target.bin", bytes_from_hex(""))
+st = {"phase": "idle"}
+bm_reset(st, "bm_image.bin", "bm_target.bin")
+show("flash begin: {bm_flash_begin(st) == Yes}")
+t0 = st["total"]
+show("total: {t0}")
+while st["phase"] == "flash" {
+    d0 = st["done"]
+    show("flash step at {d0}")
+    bm_flash_step(st)
+}
+p0 = st["phase"]
+show("phase after flash: {p0}")
+bm_verify_begin(st)
+while st["phase"] == "verify" {
+    d1 = st["done"]
+    show("verify step at {d1}")
+    bm_verify_step(st)
+}
+p1 = st["phase"]
+show("phase after verify: {p1}")
+m2 = st["message"]
+show("verify message: {m2}")
+
+$ ---- whole-file deep compare, independent of the engine's own verify ----
+sh = storage.open("bm_target.bin")
+tgt = storage.read(sh, 0, 1000000)
+storage.close(sh)
+fh2 = filesystem.open("bm_image.bin")
+src = filesystem.read_at(fh2, 0, 1000000)
+filesystem.close(fh2)
+show("target == image whole: {tgt == src}")
+show("target size: {count(tgt)}")
+
+$ ---- corrupt the target -> verify must fail with a mismatch ----
+filesystem.write_bytes("bm_bad.bin", bytes_from_hex(""))
+st2 = {"phase": "idle"}
+bm_reset(st2, "bm_image.bin", "bm_bad.bin")
+bm_flash_begin(st2)
+while st2["phase"] == "flash" { bm_flash_step(st2) }
+h2 = storage.open("bm_bad.bin")
+storage.write(h2, 5, bytes_from_hex("ff"))
+storage.close(h2)
+bm_verify_begin(st2)
+while st2["phase"] == "verify" { bm_verify_step(st2) }
+p2 = st2["phase"]
+m3 = st2["message"]
+show("mismatch phase: {p2}")
+show("mismatch message: {m3}")
+
+$ ---- LARGER target than image: the real-device verify root cause ----
+$ A physical storage device is (almost) always BIGGER than the image being
+$ flashed: the image ends mid-chunk (160000 = 28928 into a 65536 window),
+$ but the target's final read still returns a FULL chunk because the device
+$ is bigger. Verification must compare exactly count(source) bytes -- the
+$ image's final 28928 -- against the CORRESPONDING target bytes, NOT demand
+$ the target chunk be byte-identical AND same-length as a now-empty tail.
+$ So: pre-size the target BIGGER than the image, verify must reach "done"
+$ cleanly (bytes 0..160000 match, the device's trailing extra bytes are
+$ simply never part of the image and must not be flagged).
+filesystem.write_bytes("bm_big.bin", chunk160())
+j = 0
+while j < 999 {
+    filesystem.append_bytes("bm_big.bin", chunk160())
+    j = j + 1
+}
+filesystem.append_bytes("bm_big.bin", chunk160())  $ 160160 > 160000
+sb = {"phase": "idle"}
+bm_reset(sb, "bm_image.bin", "bm_big.bin")
+bm_flash_begin(sb)
+while sb["phase"] == "flash" {
+    bm_flash_step(sb)
+}
+bm_verify_begin(sb)
+while sb["phase"] == "verify" {
+    bm_verify_step(sb)
+}
+pb = sb["phase"]
+mb = sb["message"]
+show("bigtarget phase: {pb}")
+show("bigtarget message: {mb}")
+filesystem.remove("bm_big.bin")
+sb = {"phase": "idle"}
+bm_reset(sb, "bm_image.bin", "bm_big.bin")
+bm_flash_begin(sb)
+while sb["phase"] == "flash" { bm_flash_step(sb) }
+bm_verify_begin(sb)
+while sb["phase"] == "verify" { bm_verify_step(sb) }
+pb = sb["phase"]
+mb = sb["message"]
+show("bigtarget phase: {pb}")
+show("bigtarget message: {mb}")
+$ corrupt a byte INSIDE the image span of that bigger target; it must STILL be caught.
+$ (Rebuild the 160160-byte bigger file here so this block provably owns its fixture):
+filesystem.write_bytes("bm_big.bin", chunk160())
+x = 0
+while x < 999 {
+    filesystem.append_bytes("bm_big.bin", chunk160())
+    x = x + 1
+}
+filesystem.append_bytes("bm_big.bin", chunk160())
+sb = {"phase": "idle"}
+bm_reset(sb, "bm_image.bin", "bm_big.bin")
+bm_flash_begin(sb)
+while sb["phase"] == "flash" { bm_flash_step(sb) }
+hbb = storage.open("bm_big.bin")
+storage.write(hbb, 20000, bytes_from_hex("ff"))
+storage.close(hbb)
+bm_verify_begin(sb)
+while sb["phase"] == "verify" { bm_verify_step(sb) }
+pb = sb["phase"]
+mb = sb["message"]
+show("bigbad phase: {pb}")
+show("bigbad message: {mb}")
+filesystem.remove("bm_big.bin")
+
+$ ---- cancel mid-flash aborts promptly ----
+filesystem.write_bytes("bm_cancel.bin", bytes_from_hex(""))
+st3 = {"phase": "idle"}
+bm_reset(st3, "bm_image.bin", "bm_cancel.bin")
+bm_flash_begin(st3)
+bm_flash_step(st3)
+place(st3, "cancelled", Yes)
+bm_flash_step(st3)
+p3 = st3["phase"]
+m4 = st3["message"]
+show("cancel phase: {p3}")
+show("cancel message: {m4}")
+
+$ ---- size formatting ----
+show("fmt 0: {bm_fmt_size(0)}")
+show("fmt 512: {bm_fmt_size(512)}")
+show("fmt 200000: {bm_fmt_size(200000)}")
+show("fmt 107374182400: {bm_fmt_size(107374182400)}")
+show("engine test done")
+
+filesystem.remove("bm_image.bin")
+filesystem.remove("bm_empty0.bin")
+filesystem.remove("bm_target.bin")
+filesystem.remove("bm_bad.bin")
+filesystem.remove("bm_cancel.bin")

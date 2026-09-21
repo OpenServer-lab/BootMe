@@ -1,0 +1,11 @@
+project
+  name "BootMe"
+  version "0.1.0"
+  description "Image flasher written entirely in Fly"
+  author "TheServer-lab"
+  source "src/main.fly"
+  output "bin/bootme"
+  deps coll [ ]
+  subsystem "windows"
+  icon "assates/bootme_logo.ico"
+  elevate "requireAdministrator"

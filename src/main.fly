@@ -1,0 +1,205 @@
+$ BootMe -- a disk-image writer / boot-media flasher, written in 100% Fly.
+$
+$ The flasher logic (write + verify + cancel, size probing, device
+$ enumeration + safety filtering) lives in bootme/engine.fly as a pure,
+$ GUI-free step machine over a caller-supplied state board. THIS file is
+$ only the GUI shell: it builds the window, wires widget callbacks to engine
+$ jobs, and runs a pump-driven flash/verify loop so the window keeps
+$ repainting and the Cancel button stays live while a large image is being
+$ written.
+$
+$ Widget handles live in the `hard W` board (job-literal callbacks cannot
+$ capture locals), and are wired at top level through local aliases because
+$ Fly's member-call sugar needs a bare identifier base (`win.add(x)`), not
+$ an index expression.
+
+bring gui
+bring engine
+
+hard ST = {"phase": "idle", "image": "", "target": "", "targets": [],
+           "cancelled": No, "last_pump": 0}
+hard W = {}
+
+$ ---- pump driver: chew one chunk, then let the window repaint ---------------
+
+job bm_should_pump() {
+    t = system.time_ms()
+    if t - ST["last_pump"] >= 8 {
+        place(ST, "last_pump", t)
+        give Yes
+    }
+    give No
+}
+
+$ Runs the engine's flash then verify pass, repainting the bar/status between
+$ chunks and pumping native events so the window stays live and a Cancel
+$ click can reach bm_cancel_signal() mid-write.
+job bm_run_flash_gui() {
+    lastpct = -1
+    while ST["phase"] == "flash" {
+        if bm_flash_step(ST) == Yes { getout }
+        pct = ST["done"] * 100 / ST["total"]
+        if pct != lastpct {
+            gui.set_progress(W["bar"], pct)
+            gui.set_text(W["lbl_status"], "flashing " + tex(pct) + "%")
+            lastpct = pct
+        }
+        if bm_should_pump() == Yes { gui.pump() }
+    }
+    if ST["phase"] != "verify" { give No }
+    bm_verify_begin(ST)
+    lastpct = -1
+    while ST["phase"] == "verify" {
+        if bm_verify_step(ST) == Yes { getout }
+        pct = ST["done"] * 100 / ST["total"]
+        if pct != lastpct {
+            gui.set_progress(W["bar"], pct)
+            gui.set_text(W["lbl_status"], "verifying " + tex(pct) + "%")
+            lastpct = pct
+        }
+        if bm_should_pump() == Yes { gui.pump() }
+    }
+    give No
+}
+
+$ ---- widget callbacks -------------------------------------------------------
+
+job do_browse() {
+    picked = gui.file_open("Choose a disk image", "Disk images|*.img;*.iso;*.bin|All Files|*.*")
+    if picked != EMP {
+        place(ST, "image", picked)                          $ only LABELS/BUTTONS have
+        gui.set_text(W["lbl_status"], "image: " + picked)   $ settable text; a textbox's
+    }                                                        $ text is read-only (gui.get_text)
+}
+
+job do_refresh() {
+    err = ""
+    do {
+        devs = bm_usable_devices()
+        place(ST, "devices", devs)
+        labels = []
+        for d in devs {
+            attach(labels, bm_device_label(d))
+        }
+        gui.set_items(W["cmb_target"], labels)
+        if count(devs) > 0 {
+            place(ST, "target", devs[0]["path"])
+            gui.set_text(W["lbl_info"], bm_device_label(devs[0]))
+            gui.set_text(W["lbl_status"], "target ready")
+        }
+        if count(devs) == 0 {
+            place(ST, "target", "")
+            gui.set_text(W["lbl_info"], "no writable targets found")
+            gui.set_text(W["lbl_status"], "plug in a target and hit Refresh")
+        }
+    } grab (e) {
+        err = e
+    }
+    if count(err) > 0 {
+        gui.message_box("BootMe", "Could not refresh target devices: " + err)
+    }
+}
+
+job do_target_changed() {
+    i = gui.selected(W["cmb_target"])
+    if i >= 0 {
+        place(ST, "target", ST["devices"][i]["path"])
+        gui.set_text(W["lbl_info"], bm_device_label(ST["devices"][i]))
+    }
+}
+
+job do_cancel() {
+    place(ST, "cancelled", Yes)
+}
+
+job do_flash() {
+    img = ST["image"]
+    if count(img) == 0 {
+        img = gui.get_text(W["tbox_image"])
+    }
+    tgt = ST["target"]
+    if count(img) == 0 {
+        gui.message_box("BootMe", "Choose an image file first.")
+    }
+    if count(img) > 0 {
+        if count(tgt) == 0 {
+            gui.message_box("BootMe", "No target device selected - hit Refresh.")
+        }
+        if count(tgt) > 0 {
+            if gui.confirm("BootMe", "Write " + img + " to " + tgt + "?") == Yes {
+                bm_reset(ST, img, tgt)
+                place(ST, "last_pump", 0)
+                gui.set_progress(W["bar"], 0)
+                gui.set_text(W["lbl_status"], "preparing...")
+                caught = ""
+                do {
+                    if bm_flash_begin(ST) == Yes {
+                        bm_run_flash_gui()
+                    }
+                } grab (e) {
+                    bm_close_handles(ST)
+                    caught = e
+                }
+                if ST["phase"] == "done" {
+                    gui.message_box("BootMe", ST["message"])
+                }
+                if ST["phase"] != "done" {
+                    if count(caught) > 0 {
+                        gui.message_box("BootMe", "Error: " + caught)
+                    }
+                    if count(caught) == 0 {
+                        gui.message_box("BootMe", ST["message"])
+                    }
+                }
+                gui.set_progress(W["bar"], 0)
+                gui.set_text(W["lbl_status"], "ready")
+            }
+        }
+    }
+}
+
+$ ---- build the window -------------------------------------------------------
+
+place(W, "win", gui.window("BootMe", 520, 460))
+win = W["win"]
+
+place(W, "lbl_title", gui.label("BootMe - write a disk image to a target device"))
+win.add(W["lbl_title"])
+place(W, "lbl_img", gui.label("Image file:"))
+win.add(W["lbl_img"])
+place(W, "tbox_image", gui.textbox())
+win.add(W["tbox_image"])
+place(W, "btn_browse", gui.button("Browse..."))
+win.add(W["btn_browse"])
+place(W, "lbl_tgt", gui.label("Target device:"))
+win.add(W["lbl_tgt"])
+place(W, "cmb_target", gui.combo([]))
+win.add(W["cmb_target"])
+place(W, "btn_refresh", gui.button("Refresh"))
+win.add(W["btn_refresh"])
+place(W, "lbl_info", gui.label("no targets yet - hit Refresh"))
+win.add(W["lbl_info"])
+place(W, "bar", gui.progress())
+win.add(W["bar"])
+place(W, "lbl_status", gui.label("ready"))
+win.add(W["lbl_status"])
+place(W, "btn_flash", gui.button("Flash"))
+win.add(W["btn_flash"])
+place(W, "btn_cancel", gui.button("Cancel"))
+win.add(W["btn_cancel"])
+
+btn = W["btn_browse"]
+btn.on_click(job() { do_browse() })
+btn = W["btn_refresh"]
+btn.on_click(job() { do_refresh() })
+btn = W["btn_flash"]
+btn.on_click(job() { do_flash() })
+btn = W["btn_cancel"]
+btn.on_click(job() { do_cancel() })
+cmb = W["cmb_target"]
+cmb.on_change(job() { do_target_changed() })
+
+do_refresh()
+show("bootme: gui up")
+gui.run()
+show("bootme: gui closed")

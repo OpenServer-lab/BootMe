@@ -1,0 +1,227 @@
+$ BootMe engine -- pure-Fly write-and-verify disk imager core.
+$
+$ Every job here is a DLL-free, GUI-free, headless function over a
+$ caller-supplied state board (`st`); the GUI app (bootme/main.fly) and the
+$ e2e harness (tests/e2e/bootme_engine.fly) both drive exactly the same
+$ step machine, so what the tests prove is exactly what BootMe runs.
+$
+$ State board contract (all keys always present once bm_reset has run):
+$   phase         "idle" | "flash" | "verify" | "done" | "error"
+$   image         tex: path to the source image FILE
+$   target        tex: path to the target storage (raw device or a plain
+$                 file acting as a "virtual device" for testing)
+$   image_handle  num: filesystem.open handle while open, else 0
+$   target_handle num: storage.open handle while open, else 0
+$   total         num: image size in bytes (0 once measured)
+$   done          num: bytes processed so far (flash or verify)
+$   chunk         num: current byte offset
+$   stage         tex: "open" | "verify" (last step of the phase)
+$   message       tex: human-readable status / error text
+$   cancelled     yn: set Yes from anywhere; the next step aborts promptly
+$
+$ Driving a flash + verify (typical GUI or test loop):
+$   bm_reset(st, imagePath, targetPath)
+$   if bm_flash_begin(st) == Yes {
+$       while st["phase"] == "flash" { bm_flash_step(st) }
+$   }
+$   if st["phase"] != "error" {
+$       bm_verify_begin(st)
+$       while st["phase"] == "verify" { bm_verify_step(st) }
+$   }
+$   # now st["phase"] is "done" or "error"; st["message"] explains either.
+$
+$ Safety notes (all enforced by the runtime, not invented here): physical
+$ devices are opened EXCLUSIVELY (share mode 0 on Win32), so a target that
+$ is mounted/in use fails with a catchable error instead of corrupting data;
+$ bm_usable_devices() filters out the OS/system disk; and storage.open on
+$ anything that is not a device path treats it as an ordinary FILE, which is
+$ exactly what lets the automated tests flash without touching real disks.
+
+job bm_chunk() {
+    give 65536
+}
+
+job bm_reset(st, image, target) {
+    place(st, "phase", "idle")
+    place(st, "image", image)
+    place(st, "target", target)
+    place(st, "image_handle", 0)
+    place(st, "target_handle", 0)
+    place(st, "total", 0)
+    place(st, "done", 0)
+    place(st, "chunk", 0)
+    place(st, "stage", "")
+    place(st, "message", "")
+    place(st, "cancelled", No)
+}
+
+job bm_close_handles(st) {
+    if st["image_handle"] != 0 {
+        filesystem.close(st["image_handle"])
+        place(st, "image_handle", 0)
+    }
+    if st["target_handle"] != 0 {
+        storage.close(st["target_handle"])
+        place(st, "target_handle", 0)
+    }
+}
+
+$ Exact size of an open file handle by positioned probe: a 1-byte read at
+$ offset O returns 1 byte iff size > O, else an empty (EOF short read).
+$ Coarse doubling pass then binary search -- ~40 tiny reads, no full pass.
+job bm_file_size(h) {
+    if count(filesystem.read_at(h, 0, 1)) == 0 { give 0 }
+    if count(filesystem.read_at(h, 1, 1)) == 0 { give 1 }
+    p = 1
+    while p < 1099511627776 {
+        p = p * 2
+        if count(filesystem.read_at(h, p, 1)) == 0 { getout }
+    }
+    lo = p / 2
+    hi = p
+    while lo + 1 < hi {
+        mid = (lo + hi) / 2
+        r = count(filesystem.read_at(h, mid, 1))
+        if r > 0 {
+            lo = mid
+        }
+        if r == 0 {
+            hi = mid
+        }
+    }
+    give lo + 1
+}
+
+job bm_flash_begin(st) {
+    place(st, "phase", "flash")
+    place(st, "stage", "open")
+    place(st, "message", "flashing")
+    ih = filesystem.open(st["image"])
+    place(st, "image_handle", ih)
+    total = bm_file_size(ih)
+    if total == 0 {
+        filesystem.close(ih)
+        place(st, "image_handle", 0)
+        place(st, "phase", "error")
+        place(st, "message", "image file is empty; nothing to write")
+        give No
+    }
+    th = storage.open(st["target"])
+    place(st, "target_handle", th)
+    place(st, "total", total)
+    place(st, "done", 0)
+    place(st, "chunk", 0)
+    give Yes
+}
+
+$ One chunk of the write pass. Returns Yes when the phase is over (EOF
+$ reached, cancelled, or failed); the caller drives with
+$ `while st["phase"] == "flash" { bm_flash_step(st) }`.
+job bm_flash_step(st) {
+    if st["cancelled"] == Yes {
+        bm_close_handles(st)
+        place(st, "phase", "error")
+        place(st, "message", "cancelled during flash")
+        give Yes
+    }
+    buf = filesystem.read_at(st["image_handle"], st["chunk"], bm_chunk())
+    n = count(buf)
+    if n == 0 {
+        storage.flush(st["target_handle"])
+        bm_close_handles(st)
+        place(st, "phase", "verify")
+        place(st, "stage", "verify")
+        place(st, "chunk", 0)
+        place(st, "done", 0)
+        place(st, "message", "verifying")
+        give Yes
+    }
+    w = storage.write(st["target_handle"], st["chunk"], buf)
+    if w != n {
+        bm_close_handles(st)
+        place(st, "phase", "error")
+        place(st, "message", "short write at offset " + tex(st["chunk"]))
+        give Yes
+    }
+    fl = st["chunk"] + n
+    place(st, "chunk", fl)
+    place(st, "done", fl)
+    give No
+}
+
+job bm_verify_begin(st) {
+    place(st, "phase", "verify")
+    place(st, "stage", "verify")
+    place(st, "message", "verifying")
+    ih = filesystem.open(st["image"])
+    place(st, "image_handle", ih)
+    th = storage.open(st["target"])
+    place(st, "target_handle", th)
+    place(st, "chunk", 0)
+    place(st, "done", 0)
+    give Yes
+}
+
+$ One chunk of the verify pass: compare source vs target chunk-by-chunk
+$ (`==` on bytes is content equality, so length and bytes both match or the
+$ chunk counts as a mismatch). Returns Yes when the phase is over.
+job bm_verify_step(st) {
+    if st["cancelled"] == Yes {
+        bm_close_handles(st)
+        place(st, "phase", "error")
+        place(st, "message", "cancelled during verify")
+        give Yes
+    }
+    s = filesystem.read_at(st["image_handle"], st["chunk"], bm_chunk())
+    d = storage.read(st["target_handle"], st["chunk"], count(s))
+    if s != d {
+        bm_close_handles(st)
+        place(st, "phase", "error")
+        place(st, "message", "verify mismatch at offset " + tex(st["chunk"]))
+        give Yes
+    }
+    n = count(s)
+    if n == 0 {
+        bm_close_handles(st)
+        place(st, "phase", "done")
+        place(st, "stage", "verified")
+        place(st, "message", "verified (image matches target)")
+        give Yes
+    }
+    fl = st["chunk"] + n
+    place(st, "chunk", fl)
+    place(st, "done", fl)
+    give No
+}
+
+$ Physical targets the UI may offer, in list order. The OS/system disk is
+$ never offered (flash-into-boot-disk accidents are the #1 way this class
+$ of tool destroys a machine). storage.list() may throw when the current
+$ process lacks the access rights to enumerate drives (Windows without
+$ administrator elevation) -- bm_usable_devices() deliberately does NOT
+$ swallow that; the caller renders it.
+job bm_usable_devices() {
+    devs = storage.list()
+    out = []
+    for d in devs {
+        if d["system"] == Yes { skip }
+        attach(out, d)
+    }
+    give out
+}
+
+job bm_fmt_size(sz) {
+    if sz < 1024 { give tex(sz) + " B" }
+    kb = sz / 1024
+    if kb < 1024 { give tex(kb) + " KiB" }
+    mb = kb / 1024
+    if mb < 1024 { give tex(mb) + " MiB" }
+    gb = mb / 1024
+    give tex(gb) + " GiB"
+}
+
+job bm_device_label(d) {
+    l = d["path"] + "  |  " + d["model"] + "  |  " + bm_fmt_size(d["size"])
+    if d["removable"] == Yes { l = l + "  |  removable" }
+    give l
+}
